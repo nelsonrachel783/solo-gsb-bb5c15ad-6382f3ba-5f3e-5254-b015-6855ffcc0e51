@@ -881,6 +881,218 @@ def avoidance_muting(voice_a: dict, voice_b: dict) -> dict:
     }
 
 
+# --- Practice tracks: splitting voices into two rehearsal tracks -----------
+
+# A saved measure may have at most this many voices for the practice-track
+# preview; measures with more voices are rejected before any grouping.
+MAX_PRACTICE_TRACK_VOICES = 16
+
+
+class PracticeTracksInfeasible(Exception):
+    """The clash graph has an odd cycle: no split into two tracks exists."""
+
+    def __init__(self, cycle: list[str]) -> None:
+        super().__init__(
+            "voice clashes cannot be split into two practice tracks: "
+            + " -> ".join([*cycle, cycle[0]])
+        )
+        # Voice names in cycle order; the last one clashes back with the
+        # first, and the cycle has odd length.
+        self.cycle = cycle
+
+
+def _odd_cycle(parent: dict[int, int | None], start: int, end: int) -> list[int]:
+    """Rebuild the odd cycle closed by the same-color BFS edge (start, end).
+
+    ``parent`` holds the BFS tree of the current component (the root maps
+    to None). ``start`` and ``end`` share a color, hence their depths
+    have equal parity; the cycle start -> ... -> LCA -> ... -> end ->
+    start (tree edges plus the closing edge) therefore has odd length.
+    Returns the vertex indices in cycle order.
+    """
+    ancestors: dict[int, int] = {}
+    depth = 0
+    node: int | None = start
+    while node is not None:
+        ancestors[node] = depth
+        depth += 1
+        node = parent[node]
+
+    path_end = []
+    node = end
+    while node not in ancestors:
+        path_end.append(node)
+        node = parent[node]
+    lowest_common_ancestor = node
+
+    path_start = []
+    node = start
+    while node != lowest_common_ancestor:
+        path_start.append(node)
+        node = parent[node]
+
+    return path_start + [lowest_common_ancestor] + list(reversed(path_end))
+
+
+def practice_track_split(voices: list[dict]) -> dict:
+    """Split a measure's voices into rehearsal tracks A and B.
+
+    ``voices`` items are {"name": str, "events": [built events]} in the
+    measure's stored order. Two voices clash when any of their sound
+    events overlap in positive length (rests never clash, and neither do
+    events merely touching at a boundary); clashing voices must land on
+    different tracks, so a feasible split is exactly a 2-coloring of the
+    clash graph. When the graph is not bipartite, raises
+    PracticeTracksInfeasible carrying one odd cycle of clashing voice
+    names in cycle order.
+
+    A track's load is the sum of its voices' sound-event durations
+    (rests add nothing), kept as an exact Fraction. Among all feasible
+    splits the result minimizes |load_a - load_b|; ties are broken by
+    the lexicographically smallest A/B label sequence in stored voice
+    order ("A" before "B").
+
+    Optimization: every connected component of the clash graph admits
+    exactly two colorings, so a split is fixed by choosing one
+    orientation per component. Suffix sets of every achievable track-A
+    load give the minimum load difference exactly, and the
+    lexicographically smallest label sequence among the optimal splits
+    is rebuilt greedily in stored voice order, each orientation checked
+    for an optimal completion against those suffix sets. With at most
+    MAX_PRACTICE_TRACK_VOICES voices the distinct achievable sums stay
+    trivially bounded.
+
+    Returns {"track_a": [names], "track_b": [names], "load_a": Fraction,
+    "load_b": Fraction, "load_difference": Fraction} with both name
+    lists in stored voice order and load_difference = |load_a - load_b|.
+    """
+    names = [voice["name"] for voice in voices]
+    count = len(names)
+
+    # Per-voice load: the total duration of its sound events only.
+    sound_loads = [
+        sum(
+            (
+                event["duration"]
+                for event in voice["events"]
+                if event["kind"] == KIND_SOUND
+            ),
+            Fraction(0),
+        )
+        for voice in voices
+    ]
+
+    # Clash edges between voice pairs with a positive-length sound overlap.
+    adjacency: list[list[int]] = [[] for _ in range(count)]
+    for left in range(count):
+        for right in range(left + 1, count):
+            if find_sound_conflicts(voices[left], voices[right]):
+                adjacency[left].append(right)
+                adjacency[right].append(left)
+
+    # 2-color each connected component with BFS; a same-color edge closes
+    # an odd cycle and makes every split impossible.
+    color: list[int | None] = [None] * count
+    components: list[list[int]] = []
+    for root in range(count):
+        if color[root] is not None:
+            continue
+        color[root] = 0
+        parent: dict[int, int | None] = {root: None}
+        queue = deque([root])
+        members: list[int] = []
+        while queue:
+            node = queue.popleft()
+            members.append(node)
+            for neighbor in adjacency[node]:
+                if color[neighbor] is None:
+                    color[neighbor] = 1 - color[node]
+                    parent[neighbor] = node
+                    queue.append(neighbor)
+                elif color[neighbor] == color[node]:
+                    cycle = _odd_cycle(parent, node, neighbor)
+                    raise PracticeTracksInfeasible([names[i] for i in cycle])
+        components.append(members)
+
+    # Total sound load on each BFS color of each component.
+    side_loads = []
+    for members in components:
+        pair = [Fraction(0), Fraction(0)]
+        for member in members:
+            pair[color[member]] += sound_loads[member]
+        side_loads.append(pair)
+
+    total_load = sum(sound_loads, Fraction(0))
+
+    # Suffix reachable loads: reachable[k] holds every track-A total the
+    # components k.. can produce. Sets collapse duplicate sums, so the
+    # work stays proportional to the number of distinct achievable sums
+    # (at most 2 ** len(components)).
+    reachable: list[set[Fraction]] = [set() for _ in range(len(components) + 1)]
+    reachable[len(components)] = {Fraction(0)}
+    for index in range(len(components) - 1, -1, -1):
+        side_a, side_b = side_loads[index]
+        following = reachable[index + 1]
+        reachable[index] = {
+            subtotal + side_a for subtotal in following
+        } | {subtotal + side_b for subtotal in following}
+
+    # The optimal track-A totals: |load_a - load_b| = |2*load_a - total|.
+    best_difference = min(
+        abs(2 * subtotal - total_load) for subtotal in reachable[0]
+    )
+    targets = {
+        (total_load + best_difference) / 2,
+        (total_load - best_difference) / 2,
+    }
+
+    component_of = [0] * count
+    for component_index, members in enumerate(components):
+        for member in members:
+            component_of[member] = component_index
+
+    # Greedy lexicographic reconstruction in stored voice order: when the
+    # first still-undecided component is met, take the orientation that
+    # labels this voice "A" whenever an optimal completion still exists
+    # (checked against the suffix reachable sets); otherwise flip it.
+    labels = [""] * count
+    orientation: list[int | None] = [None] * len(components)
+    fixed_load = Fraction(0)
+    for voice_index in range(count):
+        component_index = component_of[voice_index]
+        decided = orientation[component_index]
+        if decided is None:
+            # Components are decided in index order, so every component
+            # before this one already contributes to fixed_load and the
+            # remaining ones are exactly reachable[component_index + 1].
+            preferred = color[voice_index]  # flip labeling this voice "A"
+            for flip in (preferred, 1 - preferred):
+                candidate = fixed_load + side_loads[component_index][flip]
+                if any(
+                    target - candidate in reachable[component_index + 1]
+                    for target in targets
+                ):
+                    decided = flip
+                    break
+            assert decided is not None  # the optimum is always completable
+            orientation[component_index] = decided
+            fixed_load += side_loads[component_index][decided]
+        labels[voice_index] = "AB"[color[voice_index] ^ decided]
+
+    load_a = sum(
+        (sound_loads[i] for i in range(count) if labels[i] == "A"),
+        Fraction(0),
+    )
+    load_b = total_load - load_a
+    return {
+        "track_a": [names[i] for i in range(count) if labels[i] == "A"],
+        "track_b": [names[i] for i in range(count) if labels[i] == "B"],
+        "load_a": load_a,
+        "load_b": load_b,
+        "load_difference": abs(load_a - load_b),
+    }
+
+
 # --- Tempo segments: mapping measure offsets to wall-clock seconds --------
 
 # A positive decimal: "120", "120.5" (no sign, no exponent, digits on

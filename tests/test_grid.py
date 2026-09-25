@@ -8,6 +8,7 @@ from app.grid import (
     KIND_REST,
     KIND_SOUND,
     LoopAlignmentTooLarge,
+    PracticeTracksInfeasible,
     QuantizationInfeasible,
     TempoSegmentsInvalid,
     align_loops,
@@ -24,6 +25,7 @@ from app.grid import (
     parse_nonnegative_rational,
     parse_positive_decimal,
     parse_rational,
+    practice_track_split,
     quantize_measure,
     rational_lcm,
     voice_total,
@@ -887,6 +889,194 @@ class LeadHandoffPreviewTest(unittest.TestCase):
         result = lead_handoff_preview(voices)
         self.assertEqual(self.leaders(result), ["a", None, None, "b"])
         self.assertEqual(result["handoff_count"], 0)
+
+
+class PracticeTrackSplitTest(unittest.TestCase):
+    def test_clashing_voices_are_separated_and_loads_balanced(self):
+        # melody sounds [0,1/2) and [3/4,1) (load 3/4); bass sounds
+        # [1/4,1) (load 3/4). They overlap on [1/4,1/2), so they must be
+        # separated; the even 3/4 vs 3/4 split wins, and the ("A","B")
+        # label sequence beats ("B","A") on the tie.
+        voices = make_voices(
+            [
+                ("melody", [
+                    (KIND_SOUND, "1/2"), (KIND_REST, "1/4"), (KIND_SOUND, "1/4"),
+                ]),
+                ("bass", [(KIND_REST, "1/4"), (KIND_SOUND, "3/4")]),
+            ]
+        )
+        result = practice_track_split(voices)
+        self.assertEqual(result["track_a"], ["melody"])
+        self.assertEqual(result["track_b"], ["bass"])
+        self.assertEqual(result["load_a"], Fraction(3, 4))
+        self.assertEqual(result["load_b"], Fraction(3, 4))
+        self.assertEqual(result["load_difference"], Fraction(0))
+
+    def test_boundary_contact_is_not_a_clash(self):
+        # a's sound ends exactly where b's starts: no positive overlap,
+        # so the split is free and the balanced one is chosen.
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+                ("b", [(KIND_REST, "1/2"), (KIND_SOUND, "1/2")]),
+            ]
+        )
+        result = practice_track_split(voices)
+        self.assertEqual(result["track_a"], ["a"])
+        self.assertEqual(result["track_b"], ["b"])
+        self.assertEqual(result["load_a"], Fraction(1, 2))
+        self.assertEqual(result["load_b"], Fraction(1, 2))
+        self.assertEqual(result["load_difference"], Fraction(0))
+
+    def test_rests_add_nothing_to_the_loads(self):
+        # All-rest measure: every load is 0, every split ties, so the
+        # lexicographically smallest label sequence (all "A") wins.
+        voices = make_voices(
+            [
+                ("a", [(KIND_REST, "1")]),
+                ("b", [(KIND_REST, "1")]),
+            ]
+        )
+        result = practice_track_split(voices)
+        self.assertEqual(result["track_a"], ["a", "b"])
+        self.assertEqual(result["track_b"], [])
+        self.assertEqual(result["load_a"], Fraction(0))
+        self.assertEqual(result["load_b"], Fraction(0))
+        self.assertEqual(result["load_difference"], Fraction(0))
+
+    def test_load_balancing_picks_the_even_split(self):
+        # No clashes; sound loads 1/2, 1/4, 1/4. The even split {a} vs
+        # {b, c} (difference 0) beats every lumped-together split.
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+                ("b", [
+                    (KIND_REST, "1/2"), (KIND_SOUND, "1/4"), (KIND_REST, "1/4"),
+                ]),
+                ("c", [(KIND_REST, "3/4"), (KIND_SOUND, "1/4")]),
+            ]
+        )
+        result = practice_track_split(voices)
+        self.assertEqual(result["track_a"], ["a"])
+        self.assertEqual(result["track_b"], ["b", "c"])
+        self.assertEqual(result["load_a"], Fraction(1, 2))
+        self.assertEqual(result["load_b"], Fraction(1, 2))
+        self.assertEqual(result["load_difference"], Fraction(0))
+
+    def test_isolated_voice_joins_track_a_on_ties(self):
+        # p and q clash (both sound the first half); r rests through the
+        # measure. Every split has difference 0, so the lexicographically
+        # smallest label sequence ("A","B","A") puts r on track A.
+        voices = make_voices(
+            [
+                ("p", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+                ("q", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+                ("r", [(KIND_REST, "1")]),
+            ]
+        )
+        result = practice_track_split(voices)
+        self.assertEqual(result["track_a"], ["p", "r"])
+        self.assertEqual(result["track_b"], ["q"])
+        self.assertEqual(result["load_difference"], Fraction(0))
+
+    def test_bipartite_chain_forces_shared_tracks(self):
+        # a overlaps b ([1/4,1/2)), b overlaps c ([3/4,7/8)), a and c
+        # never overlap: a and c are forced onto the same track. Both
+        # orientations differ by 1/8, so the tie goes to ("A","B","A").
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+                ("b", [
+                    (KIND_REST, "1/4"), (KIND_SOUND, "5/8"), (KIND_REST, "1/8"),
+                ]),
+                ("c", [(KIND_REST, "3/4"), (KIND_SOUND, "1/4")]),
+            ]
+        )
+        result = practice_track_split(voices)
+        self.assertEqual(result["track_a"], ["a", "c"])
+        self.assertEqual(result["track_b"], ["b"])
+        self.assertEqual(result["load_a"], Fraction(3, 4))
+        self.assertEqual(result["load_b"], Fraction(5, 8))
+        self.assertEqual(result["load_difference"], Fraction(1, 8))
+
+    def test_exact_fraction_loads_no_floating_point_error(self):
+        # Thirds would misbehave in floats: x and y clash (both sound
+        # [0,1/3)), z rests; loads come out as exact thirds.
+        voices = make_voices(
+            [
+                ("x", [(KIND_SOUND, "1/3"), (KIND_REST, "2/3")]),
+                ("y", [(KIND_SOUND, "1/3"), (KIND_REST, "2/3")]),
+                ("z", [(KIND_REST, "1")]),
+            ]
+        )
+        result = practice_track_split(voices)
+        self.assertEqual(result["track_a"], ["x", "z"])
+        self.assertEqual(result["track_b"], ["y"])
+        self.assertEqual(result["load_a"], Fraction(1, 3))
+        self.assertEqual(result["load_b"], Fraction(1, 3))
+        self.assertEqual(result["load_difference"], Fraction(0))
+
+    def test_odd_clash_cycle_raises_with_the_clashing_voices(self):
+        # Three voices all sounding the whole measure: a triangle of
+        # clashes cannot be 2-colored.
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1")]),
+                ("b", [(KIND_SOUND, "1")]),
+                ("c", [(KIND_SOUND, "1")]),
+            ]
+        )
+        with self.assertRaises(PracticeTracksInfeasible) as ctx:
+            practice_track_split(voices)
+        cycle = ctx.exception.cycle
+        self.assertEqual(sorted(cycle), ["a", "b", "c"])
+        # The reported cycle is odd and closes back on its first voice.
+        self.assertEqual(len(cycle) % 2, 1)
+
+    def test_odd_cycle_inside_a_larger_measure_is_reported(self):
+        # The triangle b-c-d clashes mutually on [1/4,1/2); a only
+        # overlaps b. The split is impossible and the reported cycle
+        # involves only clashing voices.
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1/4"), (KIND_REST, "3/4")]),
+                ("b", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+                ("c", [(KIND_REST, "1/4"), (KIND_SOUND, "1/4"),
+                       (KIND_REST, "1/2")]),
+                ("d", [(KIND_REST, "1/4"), (KIND_SOUND, "1/4"),
+                       (KIND_REST, "1/2")]),
+            ]
+        )
+        with self.assertRaises(PracticeTracksInfeasible) as ctx:
+            practice_track_split(voices)
+        cycle = ctx.exception.cycle
+        self.assertEqual(sorted(cycle), ["b", "c", "d"])
+
+    def test_sixteen_independent_voices_split_by_load(self):
+        # The voice cap allows exactly 16 voices. Voice i sounds only on
+        # [i/16, (i+1)/16), so nothing clashes and the enumeration
+        # balances the tracks exactly: 8 voices of load 1/16 each side.
+        voices = make_voices(
+            [
+                (
+                    f"v{i}",
+                    [
+                        *([(KIND_REST, f"{i}/16")] if i else []),
+                        (KIND_SOUND, "1/16"),
+                        *([(KIND_REST, f"{15 - i}/16")] if i < 15 else []),
+                    ],
+                )
+                for i in range(16)
+            ]
+        )
+        result = practice_track_split(voices)
+        self.assertEqual(result["load_a"], Fraction(8, 16))
+        self.assertEqual(result["load_b"], Fraction(8, 16))
+        self.assertEqual(result["load_difference"], Fraction(0))
+        # Every 8/8 split ties, so the lexicographically smallest label
+        # sequence puts the first eight voices on track A.
+        self.assertEqual(result["track_a"], [f"v{i}" for i in range(8)])
+        self.assertEqual(result["track_b"], [f"v{i}" for i in range(8, 16)])
 
 
 class ParsePositiveDecimalTest(unittest.TestCase):

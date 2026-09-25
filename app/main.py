@@ -52,6 +52,16 @@ of handoffs (leader changes between adjacent sounding segments; a
 change across rest never counts); ties are broken by the
 lexicographically smallest leader sequence in stored voice order. It
 is a read-only preview; nothing is written back to SQLite.
+
+A saved measure's voices (at most 16) can also be previewed as two
+rehearsal tracks (POST /measures/{id}/practice-tracks): any two voices
+whose sound events overlap in positive length must land on different
+tracks. When the clash graph cannot be 2-colored the request is
+rejected with one odd cycle of clashing voices; otherwise the split
+minimizes the absolute difference of the two tracks' total sounding
+durations, ties broken by the lexicographically smallest A/B label
+sequence in stored voice order. It is a read-only preview; nothing is
+written back to SQLite.
 """
 
 from __future__ import annotations
@@ -64,7 +74,9 @@ from fastapi import FastAPI, HTTPException
 from . import db
 from .grid import (
     MAX_EXPANDED_EVENTS,
+    MAX_PRACTICE_TRACK_VOICES,
     LoopAlignmentTooLarge,
+    PracticeTracksInfeasible,
     QuantizationInfeasible,
     TempoSegmentsInvalid,
     align_loops,
@@ -79,6 +91,7 @@ from .grid import (
     lead_handoff_preview,
     parse_nonnegative_rational,
     parse_rational,
+    practice_track_split,
     quantize_measure,
     voice_total,
 )
@@ -92,6 +105,7 @@ from .schemas import (
     MeasureIn,
     MeasureOut,
     Mismatch,
+    PracticeTracksOut,
     QuantizationPreviewIn,
     QuantizationPreviewOut,
     RhythmMatchesOut,
@@ -130,6 +144,7 @@ def root() -> dict:
             "avoidance_preview": "POST /measures/{id}/avoidance-preview",
             "time_preview": "POST /measures/{id}/time-preview",
             "lead_handoff_preview": "POST /measures/{id}/lead-handoff-preview",
+            "practice_tracks": "POST /measures/{id}/practice-tracks",
         },
     }
 
@@ -556,4 +571,53 @@ def lead_handoff_preview_route(measure_id: int) -> dict:
             }
             for segment in result["segments"]
         ],
+    }
+
+
+@app.post(
+    "/measures/{measure_id}/practice-tracks",
+    response_model=PracticeTracksOut,
+)
+def practice_tracks(measure_id: int) -> dict:
+    # Read-only: the split is computed from the stored measure in exact
+    # fractions, but SQLite is never written back to.
+    measure = db.load_measure(measure_id)
+    if measure is None:
+        raise HTTPException(status_code=404, detail="measure not found")
+
+    if len(measure["voices"]) > MAX_PRACTICE_TRACK_VOICES:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "too many voices for a practice-track split",
+                "voices": len(measure["voices"]),
+                "limit": MAX_PRACTICE_TRACK_VOICES,
+            },
+        )
+
+    _, voices = _fraction_voices(measure)
+    try:
+        result = practice_track_split(voices)
+    except PracticeTracksInfeasible as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "voice conflicts cannot be split into two "
+                "practice tracks",
+                "cycle": exc.cycle,
+            },
+        ) from exc
+
+    return {
+        "measure_id": measure["id"],
+        "target_duration": measure["target_duration"],
+        "track_a": {
+            "voices": result["track_a"],
+            "load": format_rational(result["load_a"]),
+        },
+        "track_b": {
+            "voices": result["track_b"],
+            "load": format_rational(result["load_b"]),
+        },
+        "load_difference": format_rational(result["load_difference"]),
     }

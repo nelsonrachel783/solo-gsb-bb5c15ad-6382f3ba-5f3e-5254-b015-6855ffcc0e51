@@ -276,6 +276,23 @@ class AvoidancePreviewOut(BaseModel):
     conflicts: list[ConflictPairOut]
 
 
+class PracticeTrackOut(BaseModel):
+    """One rehearsal track: the voices assigned to it and its load."""
+
+    voices: list[str]
+    # Sum of the assigned voices' sound-event durations (exact fraction).
+    load: str
+
+
+class PracticeTracksOut(BaseModel):
+    measure_id: int
+    target_duration: str
+    track_a: PracticeTrackOut
+    track_b: PracticeTrackOut
+    # |track_a.load - track_b.load| (the minimized objective).
+    load_difference: str
+
+
 class TempoSegmentIn(BaseModel):
     """One tempo segment: bpm runs linearly from start_bpm to end_bpm.
 
