@@ -504,6 +504,91 @@ bass 领后两段只需在中间换手一次，为最少换手方案：
 {"detail": "measure not found"}
 ```
 
+### `POST /measures/{id}/practice-tracks` — 排练双轨分组预览（只读，不写库）
+
+把已保存小节的**至多 16 个声部**预分到两条排练轨道 **A / B**：
+
+- 任意两个声部只要有一对**发声事件**（`kind = "sound"`，休止不计）的半开区间存在
+  **正长度重叠**（仅边界相接 `end == start` 不算），就构成冲突、**必须分到不同轨**；
+- 冲突关系即声部冲突图；当它**无法二染色**（非二分图，必含奇数环）时，不存在合法
+  双轨分组，返回 **422**，detail 的 `contradicting_voices` 给出**一组构成矛盾的声部**
+  （一个奇环，环内相邻声部两两冲突）；
+- 对每个可行分组，以各声部**发声事件时长之和**（休止计 0，精确分数）作为该声部负载，
+  分别求两轨负载 `load_a` / `load_b`，选取**|两轨负载差|最小**者；
+- 负载差相同时，按小节中声部的**原始存储顺序**比较 A/B 轨标记序列，取**字典序最小**
+  者（**A 先于 B**，即越靠前的声部越优先放入 A 轨）。
+
+内部先用 BFS 二染色判定二分性并在失败时沿 BFS 树重构出奇环证书；每个连通分量只有
+「正放 / 翻转」两种朝向（孤立声部可自由选轨），声部不超过 16 个，故全部可行分组至多
+2¹⁶ = 65536 种，逐一精确枚举取最优，无近似。全部运算使用 `fractions.Fraction`
+精确完成。
+
+- 请求**无请求体**（直接 POST）；响应给出两轨声部列表（保持小节内声部顺序，并附每个
+  声部的发声负载 `weight`）、两轨精确分数负载 `load_a` / `load_b` 及最小负载差
+  `load_difference`。
+- 小节 ID 不存在返回 **404**；小节声部数**超过 16** 返回 **422**（detail 给出
+  `voice_count` / `limit`，此时不进行分组计算）。
+- 该接口为**只读预览，不写入数据库**，已保存小节保持不变。
+
+```bash
+curl -s -X POST http://localhost:8000/measures/1/practice-tracks
+```
+
+例：小节时长 `1`，三个声部互不冲突，发声负载分别为 `1/2`（`a`，`[0,1/2)`）、
+`1/3`（`b`，`[1/2,5/6)`）、`1/6`（`c`，`[5/6,1)`）。唯一均衡分组为
+`{a}` 对 `{b,c}`，两轨负载都是 `1/2`，负载差 `0`：
+
+```json
+{
+  "measure_id": 1,
+  "target_duration": "1",
+  "voices": ["a", "b", "c"],
+  "voice_count": 3,
+  "track_a": [
+    {"name": "a", "weight": "1/2"}
+  ],
+  "track_b": [
+    {"name": "b", "weight": "1/3"},
+    {"name": "c", "weight": "1/6"}
+  ],
+  "load_a": "1/2",
+  "load_b": "1/2",
+  "load_difference": "0"
+}
+```
+
+冲突不可二分的例子：`a`、`b` 都在 `[0,1/2)` 发声，`c` 在 `[1/4,3/4)` 发声，三个声部
+两两正长度重叠（奇环 = 三角形），无法分成两轨，返回 **422**：
+
+```json
+{
+  "detail": {
+    "message": "voice sound conflicts are not bipartite; the voices cannot be split into two tracks without placing an overlapping pair on the same track; nothing was saved",
+    "contradicting_voices": ["b", "a", "c"]
+  }
+}
+```
+
+声部超过上限（16）时：
+
+```json
+{
+  "detail": {
+    "message": "practice-track preview handles at most 16 voices; measure was not changed",
+    "voice_count": 17,
+    "limit": 16
+  }
+}
+```
+
+各字段含义：
+
+| 字段              | 说明                                                                 |
+| ----------------- | -------------------------------------------------------------------- |
+| `track_a` / `track_b` | 分到 A / B 轨的声部（保持小节内存储顺序）；同轨任意两声部都没有正长度发声重叠；每项附该声部发声时长之和 `weight` |
+| `load_a` / `load_b`   | 两轨各自的发声事件时长总和（精确分数字符串）                         |
+| `load_difference`     | 最小化目标：两轨负载差的绝对值（精确分数，非负）                     |
+
 > 在浏览器中打开 http://localhost:8000/ 可查看服务与接口清单，
 > http://localhost:8000/docs 为可直接发起请求的 Swagger UI。
 
@@ -520,7 +605,7 @@ python3 -m unittest discover -s tests -p 'test_grid.py'   # 仅核心逻辑（�
 
 ```
 app/
-  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、节奏等价匹配、循环对齐、等分刻度量化、双声部冲突静音（二分图最小权顶点覆盖）、速度段积分换算秒数、领奏接力最省换手预览（纯标准库）
+  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、节奏等价匹配、循环对齐、等分刻度量化、双声部冲突静音（二分图最小权顶点覆盖）、速度段积分换算秒数、领奏接力最省换手预览、排练双轨分组预览（二分性判定/奇环证书/最小负载差枚举，纯标准库）
   db.py        # SQLite 连接、建表、读写（纯标准库）
   schemas.py   # Pydantic 请求/响应模型与校验
   main.py      # FastAPI 应用与路由（启动时初始化数据库）

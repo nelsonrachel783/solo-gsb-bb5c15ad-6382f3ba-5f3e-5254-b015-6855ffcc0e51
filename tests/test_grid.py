@@ -8,6 +8,7 @@ from app.grid import (
     KIND_REST,
     KIND_SOUND,
     LoopAlignmentTooLarge,
+    PracticeTracksConflict,
     QuantizationInfeasible,
     TempoSegmentsInvalid,
     align_loops,
@@ -24,6 +25,7 @@ from app.grid import (
     parse_nonnegative_rational,
     parse_positive_decimal,
     parse_rational,
+    practice_track_assignment,
     quantize_measure,
     rational_lcm,
     voice_total,
@@ -1119,6 +1121,139 @@ class ComputeTimePreviewTest(unittest.TestCase):
         self.assertEqual(format_seconds(bass[1]["start_seconds"]), "0.500000")
         self.assertEqual(format_seconds(bass[1]["end_seconds"]), "2.386294")
         self.assertEqual(format_seconds(result["total_seconds"]), "2.386294")
+
+
+class PracticeTrackAssignmentTest(unittest.TestCase):
+    def _result(self, specs):
+        return practice_track_assignment(make_voices(specs))
+
+    def _labels(self, result, names):
+        on_a = {entry["name"] for entry in result["track_a"]}
+        return tuple(0 if name in on_a else 1 for name in names)
+
+    def test_balances_free_voices_by_sound_duration(self):
+        # No conflicts; sound loads 1/2, 1/3, 1/6 on disjoint stretches.
+        specs = [
+            ("a", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+            ("b", [(KIND_REST, "1/2"), (KIND_SOUND, "1/3"), (KIND_REST, "1/6")]),
+            ("c", [(KIND_REST, "5/6"), (KIND_SOUND, "1/6")]),
+        ]
+        result = self._result(specs)
+        self.assertEqual(result["load_a"], Fraction(1, 2))
+        self.assertEqual(result["load_b"], Fraction(1, 2))
+        self.assertEqual(result["load_difference"], Fraction(0))
+        # Tie-optimal partition {a} | {b, c}; a is stored first.
+        self.assertEqual([v["name"] for v in result["track_a"]], ["a"])
+        self.assertEqual(
+            [v["name"] for v in result["track_b"]], ["b", "c"]
+        )
+        # Reported voice weight counts sound only.
+        weights = {
+            v["name"]: v["weight"]
+            for v in result["track_a"] + result["track_b"]
+        }
+        self.assertEqual(weights, {"a": Fraction(1, 2), "b": Fraction(1, 3),
+                                   "c": Fraction(1, 6)})
+
+    def test_conflicting_voices_are_forced_apart(self):
+        # a (1/2) and b (1/4) overlap [0,1/4); c rests through every
+        # sound and weighs 1/4 at [3/4,1). The forced a/b split plus c
+        # balances 1/2 vs 1/2 only when c joins b's track.
+        specs = [
+            ("a", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+            ("b", [(KIND_SOUND, "1/4"), (KIND_REST, "3/4")]),
+            ("c", [(KIND_REST, "3/4"), (KIND_SOUND, "1/4")]),
+        ]
+        result = self._result(specs)
+        labels = self._labels(result, ["a", "b", "c"])
+        self.assertNotEqual(labels[0], labels[1])
+        self.assertEqual(result["load_a"], Fraction(1, 2))
+        self.assertEqual(result["load_b"], Fraction(1, 2))
+        self.assertEqual(result["load_difference"], Fraction(0))
+        # The swapped optimum (B,A,A) loses the lexicographic tie.
+        self.assertEqual([v["name"] for v in result["track_a"]], ["a"])
+        self.assertEqual([v["name"] for v in result["track_b"]], ["b", "c"])
+
+    def test_boundary_contact_is_not_a_conflict(self):
+        # a ends sounding exactly when b starts: no positive overlap, so
+        # they are free voices. Equal loads make the balanced split (A,B)
+        # optimal, lexicographically smaller than the swapped (B,A).
+        specs = [
+            ("a", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+            ("b", [(KIND_REST, "1/2"), (KIND_SOUND, "1/2")]),
+        ]
+        result = self._result(specs)
+        self.assertEqual(result["load_difference"], Fraction(0))
+        self.assertEqual([v["name"] for v in result["track_a"]], ["a"])
+        self.assertEqual([v["name"] for v in result["track_b"]], ["b"])
+
+    def test_non_bipartite_triangle_raises_with_odd_cycle(self):
+        # a,b share [0,1/2); c overlaps both on [1/4,3/4): odd cycle.
+        specs = [
+            ("a", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+            ("b", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+            ("c", [(KIND_REST, "1/4"), (KIND_SOUND, "1/2"),
+                   (KIND_REST, "1/4")]),
+        ]
+        built = make_voices(specs)
+        with self.assertRaises(PracticeTracksConflict) as context:
+            practice_track_assignment(built)
+        cycle = context.exception.cycle
+        # The certificate is an odd-length cycle of these three voices,
+        # every consecutive pair really conflicting.
+        self.assertEqual(sorted(cycle), ["a", "b", "c"])
+        self.assertEqual(len(cycle) % 2, 1)
+        voice_map = {spec[0]: voice for spec, voice in zip(specs, built)}
+        for i, left in enumerate(cycle):
+            right = cycle[(i + 1) % len(cycle)]
+            self.assertTrue(
+                find_sound_conflicts(voice_map[left], voice_map[right]),
+                (left, right),
+            )
+
+    def test_resting_voices_have_zero_load_and_go_to_track_a(self):
+        # Both voices rest all measure: no conflicts, zero loads; the
+        # lex-smallest labeling puts both on A.
+        specs = [
+            ("a", [(KIND_REST, "1")]),
+            ("b", [(KIND_REST, "1")]),
+        ]
+        result = self._result(specs)
+        self.assertEqual([v["name"] for v in result["track_a"]], ["a", "b"])
+        self.assertEqual(result["track_b"], [])
+        self.assertEqual(result["load_a"], Fraction(0))
+        self.assertEqual(result["load_b"], Fraction(0))
+        self.assertEqual(result["load_difference"], Fraction(0))
+
+    def test_disjoint_components_are_balanced_jointly(self):
+        # Two disjoint conflicting pairs with weights 1/2,1/2 and 1/4,1/4:
+        # a,b share [0,1/2); c,d share (1/2,1]. Each pair must split;
+        # orientations balance totals to 3/4 vs 3/4.
+        specs = [
+            ("a", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+            ("b", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+            ("c", [(KIND_REST, "1/2"), (KIND_SOUND, "1/4"),
+                   (KIND_REST, "1/4")]),
+            ("d", [(KIND_REST, "1/2"), (KIND_SOUND, "1/4"),
+                   (KIND_REST, "1/4")]),
+        ]
+        result = self._result(specs)
+        self.assertEqual(result["load_difference"], Fraction(0))
+        labels = self._labels(result, ["a", "b", "c", "d"])
+        self.assertNotEqual(labels[0], labels[1])  # a vs b
+        self.assertNotEqual(labels[2], labels[3])  # c vs d
+        # Lex-smallest optimum: the first voice of each pair goes to A.
+        self.assertEqual(labels, (0, 1, 0, 1))
+
+    def test_track_lists_keep_stored_voice_order(self):
+        specs = [
+            ("first", [(KIND_REST, "1")]),
+            ("second", [(KIND_SOUND, "1")]),
+            ("third", [(KIND_REST, "1")]),
+        ]
+        result = self._result(specs)
+        names = [v["name"] for v in result["track_a"] + result["track_b"]]
+        self.assertEqual(names, ["first", "second", "third"])
 
 
 if __name__ == "__main__":

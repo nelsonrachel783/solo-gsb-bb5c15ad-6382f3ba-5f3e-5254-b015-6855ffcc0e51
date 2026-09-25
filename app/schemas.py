@@ -276,6 +276,29 @@ class AvoidancePreviewOut(BaseModel):
     conflicts: list[ConflictPairOut]
 
 
+class PracticeTrackVoiceOut(BaseModel):
+    """One voice assigned to a rehearsal track, with its sound load."""
+
+    name: str
+    # Sum of the voice's sound-event durations (rests contribute 0).
+    weight: str
+
+
+class PracticeTracksOut(BaseModel):
+    measure_id: int
+    target_duration: str
+    voices: list[str]
+    voice_count: int
+    # Voices assigned to each track, in stored voice order. Two voices on
+    # the same track never overlap in positive-length sounding time.
+    track_a: list[PracticeTrackVoiceOut]
+    track_b: list[PracticeTrackVoiceOut]
+    # Total sound load per track, and the minimized absolute difference.
+    load_a: str
+    load_b: str
+    load_difference: str
+
+
 class TempoSegmentIn(BaseModel):
     """One tempo segment: bpm runs linearly from start_bpm to end_bpm.
 

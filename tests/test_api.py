@@ -1021,3 +1021,179 @@ def test_lead_handoff_preview_404_for_missing_measure():
     response = client.post("/measures/999999/lead-handoff-preview")
     assert response.status_code == 404
     assert response.json() == {"detail": "measure not found"}
+
+
+# --- POST /measures/{id}/practice-tracks -----------------------------------
+
+# target 1; melody sounds [0,1/2) + [3/4,1) (load 3/4), bass [1/4,1)
+# (load 3/4): they conflict and are forced onto different tracks, equal.
+def test_practice_tracks_splits_conflicting_voices_with_fractional_loads():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(f"/measures/{measure_id}/practice-tracks")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["measure_id"] == measure_id
+    assert body["target_duration"] == "1"
+    assert body["voices"] == ["melody", "bass"]
+    assert body["voice_count"] == 2
+    assert body["track_a"] == [{"name": "melody", "weight": "3/4"}]
+    assert body["track_b"] == [{"name": "bass", "weight": "3/4"}]
+    assert body["load_a"] == "3/4"
+    assert body["load_b"] == "3/4"
+    assert body["load_difference"] == "0"
+
+
+def test_practice_tracks_balances_free_voices_and_breaks_ties_lexicographically():
+    # No positive overlaps; loads 1/2, 1/3, 1/6 (fractional) -> {a} |
+    # {b, c} is the unique balanced split, difference 0.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [
+                {"kind": "sound", "duration": "1/2"},
+                {"kind": "rest", "duration": "1/2"},
+            ]},
+            {"name": "b", "events": [
+                {"kind": "rest", "duration": "1/2"},
+                {"kind": "sound", "duration": "1/3"},
+                {"kind": "rest", "duration": "1/6"},
+            ]},
+            {"name": "c", "events": [
+                {"kind": "rest", "duration": "5/6"},
+                {"kind": "sound", "duration": "1/6"},
+            ]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(f"/measures/{measure_id}/practice-tracks")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [v["name"] for v in body["track_a"]] == ["a"]
+    assert [v["name"] for v in body["track_b"]] == ["b", "c"]
+    assert body["load_a"] == "1/2"
+    assert body["load_b"] == "1/2"
+    assert body["load_difference"] == "0"
+
+
+def test_practice_tracks_boundary_contact_does_not_conflict():
+    # a sounds exactly up to 1/2, b starts at 1/2: equal free voices are
+    # split (the balanced optimum), labels (A,B) over (B,A).
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [
+                {"kind": "sound", "duration": "1/2"},
+                {"kind": "rest", "duration": "1/2"},
+            ]},
+            {"name": "b", "events": [
+                {"kind": "rest", "duration": "1/2"},
+                {"kind": "sound", "duration": "1/2"},
+            ]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(f"/measures/{measure_id}/practice-tracks")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [v["name"] for v in body["track_a"]] == ["a"]
+    assert [v["name"] for v in body["track_b"]] == ["b"]
+    assert body["load_difference"] == "0"
+
+
+def test_practice_tracks_all_rest_voices_go_to_track_a():
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [{"kind": "rest", "duration": "1"}]},
+            {"name": "b", "events": [{"kind": "rest", "duration": "1"}]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(f"/measures/{measure_id}/practice-tracks")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [v["name"] for v in body["track_a"]] == ["a", "b"]
+    assert body["track_b"] == []
+    assert body["load_a"] == "0"
+    assert body["load_b"] == "0"
+    assert body["load_difference"] == "0"
+
+
+def test_practice_tracks_non_bipartite_returns_422_with_odd_cycle():
+    # a,b sound [0,1/2); c sounds [1/4,3/4): pairwise positive overlap.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [
+                {"kind": "sound", "duration": "1/2"},
+                {"kind": "rest", "duration": "1/2"},
+            ]},
+            {"name": "b", "events": [
+                {"kind": "sound", "duration": "1/2"},
+                {"kind": "rest", "duration": "1/2"},
+            ]},
+            {"name": "c", "events": [
+                {"kind": "rest", "duration": "1/4"},
+                {"kind": "sound", "duration": "1/2"},
+                {"kind": "rest", "duration": "1/4"},
+            ]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(f"/measures/{measure_id}/practice-tracks")
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert sorted(detail["contradicting_voices"]) == ["a", "b", "c"]
+    assert len(detail["contradicting_voices"]) % 2 == 1
+    assert "saved" in detail["message"]
+    assert "track_a" not in response.text
+
+
+def test_practice_tracks_too_many_voices_returns_422():
+    # 17 distinct voices summing to target 1 each: limit is 16.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": f"v{i:02d}", "events": [
+                {"kind": "rest", "duration": "1/17"},
+            ] * 17}
+            for i in range(17)
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(f"/measures/{measure_id}/practice-tracks")
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert detail["voice_count"] == 17
+    assert detail["limit"] == 16
+    assert "track_a" not in response.text
+
+
+def test_practice_tracks_sixteen_voices_is_accepted():
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": f"v{i:02d}", "events": [
+                {"kind": "rest", "duration": "1/16"},
+            ] * 16}
+            for i in range(16)
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(f"/measures/{measure_id}/practice-tracks")
+    assert response.status_code == 200, response.text
+    assert response.json()["voice_count"] == 16
+
+
+def test_practice_tracks_is_read_only():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    before = client.get(f"/measures/{measure_id}").json()
+    response = client.post(f"/measures/{measure_id}/practice-tracks")
+    assert response.status_code == 200
+    assert client.get(f"/measures/{measure_id}").json() == before
+
+
+def test_practice_tracks_404_for_missing_measure():
+    response = client.post("/measures/999999/practice-tracks")
+    assert response.status_code == 404
+    assert response.json() == {"detail": "measure not found"}

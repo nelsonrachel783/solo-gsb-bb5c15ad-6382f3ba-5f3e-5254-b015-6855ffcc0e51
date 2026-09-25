@@ -52,6 +52,17 @@ of handoffs (leader changes between adjacent sounding segments; a
 change across rest never counts); ties are broken by the
 lexicographically smallest leader sequence in stored voice order. It
 is a read-only preview; nothing is written back to SQLite.
+
+A saved measure's voices can finally be grouped into two rehearsal
+tracks (POST /measures/{id}/practice-tracks): voices with any
+positive-length overlap of sound events must take different tracks;
+when the conflict graph is not bipartite the service returns 422 with
+one contradictory odd cycle of voices. For every feasible grouping it
+compares the two tracks' total sounding durations and returns the
+grouping with the smallest absolute load difference, ties broken by
+the lexicographically smallest A/B label sequence in stored voice
+order (A before B). It is a read-only preview; nothing is written back
+to SQLite.
 """
 
 from __future__ import annotations
@@ -64,7 +75,9 @@ from fastapi import FastAPI, HTTPException
 from . import db
 from .grid import (
     MAX_EXPANDED_EVENTS,
+    MAX_PRACTICE_VOICES,
     LoopAlignmentTooLarge,
+    PracticeTracksConflict,
     QuantizationInfeasible,
     TempoSegmentsInvalid,
     align_loops,
@@ -79,6 +92,7 @@ from .grid import (
     lead_handoff_preview,
     parse_nonnegative_rational,
     parse_rational,
+    practice_track_assignment,
     quantize_measure,
     voice_total,
 )
@@ -92,6 +106,7 @@ from .schemas import (
     MeasureIn,
     MeasureOut,
     Mismatch,
+    PracticeTracksOut,
     QuantizationPreviewIn,
     QuantizationPreviewOut,
     RhythmMatchesOut,
@@ -130,6 +145,7 @@ def root() -> dict:
             "avoidance_preview": "POST /measures/{id}/avoidance-preview",
             "time_preview": "POST /measures/{id}/time-preview",
             "lead_handoff_preview": "POST /measures/{id}/lead-handoff-preview",
+            "practice_tracks": "POST /measures/{id}/practice-tracks",
         },
     }
 
@@ -556,4 +572,61 @@ def lead_handoff_preview_route(measure_id: int) -> dict:
             }
             for segment in result["segments"]
         ],
+    }
+
+
+@app.post(
+    "/measures/{measure_id}/practice-tracks",
+    response_model=PracticeTracksOut,
+)
+def practice_tracks_preview(measure_id: int) -> dict:
+    # Read-only: the conflict graph and the minimum-imbalance two-track
+    # grouping are computed in exact fractions, but SQLite is never
+    # written to.
+    measure = db.load_measure(measure_id)
+    if measure is None:
+        raise HTTPException(status_code=404, detail="measure not found")
+
+    voice_names = [voice["name"] for voice in measure["voices"]]
+    if len(voice_names) > MAX_PRACTICE_VOICES:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": f"practice-track preview handles at most "
+                f"{MAX_PRACTICE_VOICES} voices; measure was not changed",
+                "voice_count": len(voice_names),
+                "limit": MAX_PRACTICE_VOICES,
+            },
+        )
+
+    _, voices = _fraction_voices(measure)
+    try:
+        result = practice_track_assignment(voices)
+    except PracticeTracksConflict as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "voice sound conflicts are not bipartite; the "
+                "voices cannot be split into two tracks without placing an "
+                "overlapping pair on the same track; nothing was saved",
+                "contradicting_voices": exc.cycle,
+            },
+        ) from exc
+
+    return {
+        "measure_id": measure["id"],
+        "target_duration": measure["target_duration"],
+        "voices": voice_names,
+        "voice_count": len(voice_names),
+        "track_a": [
+            {"name": voice["name"], "weight": format_rational(voice["weight"])}
+            for voice in result["track_a"]
+        ],
+        "track_b": [
+            {"name": voice["name"], "weight": format_rational(voice["weight"])}
+            for voice in result["track_b"]
+        ],
+        "load_a": format_rational(result["load_a"]),
+        "load_b": format_rational(result["load_b"]),
+        "load_difference": format_rational(result["load_difference"]),
     }

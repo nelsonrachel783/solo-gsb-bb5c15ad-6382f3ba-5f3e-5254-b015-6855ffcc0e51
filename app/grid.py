@@ -26,6 +26,10 @@ KINDS = (KIND_SOUND, KIND_REST)
 # expand to; over this the request is rejected and no timeline is built.
 MAX_EXPANDED_EVENTS = 2000
 
+# Cap on the voices of one saved measure that a practice-track preview
+# groups into two tracks; a measure with more voices is rejected there.
+MAX_PRACTICE_VOICES = 16
+
 
 def _parse_unsigned_rational(text: str) -> Fraction:
     """Shared parser for non-negative fraction strings (no sign)."""
@@ -878,6 +882,208 @@ def avoidance_muting(voice_a: dict, voice_b: dict) -> dict:
         "total_muted": sum(
             (entry["event"]["duration"] for entry in muted), Fraction(0)
         ),
+    }
+
+
+# --- Practice tracks: grouping voices into two non-overlapping tracks ------
+
+class PracticeTracksConflict(Exception):
+    """The conflict graph is not bipartite (voices cannot fill two tracks)."""
+
+    def __init__(self, cycle: list[str]) -> None:
+        super().__init__(
+            f"voice conflicts are not bipartite: {len(cycle)} voices "
+            "form an odd cycle"
+        )
+        self.cycle = cycle
+
+
+def _find_odd_cycle(
+    adjacency: list[list[int]],
+    color: list[int],
+    parent: list[int],
+    depth: list[int],
+    u: int,
+    v: int,
+) -> list[int]:
+    """Reconstruct the odd cycle closed by the same-color edge u--v.
+
+    During BFS coloring an edge joining two already-colored vertices of
+    the same color proves an odd cycle. Both u and v reach their common
+    BFS-tree ancestor: walking up u then back down to v, closed by the
+    edge v--u, gives that cycle. Parity: both depths have the same parity
+    (equal colors), so depth[u] + depth[v] - 2*depth[ancestor] is even,
+    hence the cycle has that many + 1 edges: an odd number.
+    """
+    chain_u: list[int] = []
+    node = u
+    while depth[node] > depth[v]:
+        chain_u.append(node)
+        node = parent[node]
+    chain_v: list[int] = []
+    other = v
+    while depth[other] > depth[u]:
+        chain_v.append(other)
+        other = parent[other]
+    # Both walkers are now at equal depth; climb together to the LCA.
+    while node != other:
+        chain_u.append(node)
+        chain_v.append(other)
+        node = parent[node]
+        other = parent[other]
+    chain_u.append(node)  # the common ancestor
+    # chain_v is ordered from v upward, so reverse it for the descent.
+    return chain_u + chain_v[::-1]
+
+
+def practice_track_assignment(voices: list[dict]) -> dict:
+    """Group a measure's voices into two rehearsal tracks with minimal load
+    imbalance.
+
+    Two voices conflict whenever any pair of their sound events overlaps
+    in strictly positive length (half-open intervals; rest events and
+    mere boundary contact never conflict). Conflicting voices must land
+    on different tracks, so a feasible grouping exists exactly when the
+    conflict graph is bipartite; an odd cycle raises
+    PracticeTracksConflict carrying one such cycle of voice names.
+
+    A voice's load is the sum of its sound-event durations (rests count
+    zero), and each track's load is the load of the voices assigned to
+    it. Among all feasible groupings the result minimizes the absolute
+    load difference between the two tracks. Ties are broken by the
+    lexicographically smallest track-label sequence over the voices in
+    their stored order, with A before B: the first differing voice goes
+    to A whenever an optimum still exists.
+
+    The conflict graph is checked (and the odd cycle certified) with a
+    BFS two-coloring. Each connected component then has exactly two
+    orientations: its BFS color-0 voice set goes to A and color-1 to B,
+    or the reverse. Isolated voices (no conflicts) are one-vertex
+    components and may take either track freely. With at most
+    MAX_PRACTICE_VOICES voices there are no more than 2**16 = 65536
+    orientations, so every feasible grouping is enumerated exactly and
+    the (difference, label sequence) lexicographic minimum is taken.
+
+    ``voices`` items are {"name": str, "events": [built events]}. Returns
+    {"track_a": [voice dicts...], "track_b": [...], "load_a": Fraction,
+    "load_b": Fraction, "load_difference": Fraction}; each voice dict is
+    {"name", "weight"} and the track lists keep the stored voice order.
+    """
+    weights = [
+        sum(
+            (
+                event["duration"]
+                for event in voice["events"]
+                if event["kind"] == KIND_SOUND
+            ),
+            Fraction(0),
+        )
+        for voice in voices
+    ]
+
+    count = len(voices)
+    adjacency: list[list[int]] = [[] for _ in range(count)]
+    for i in range(count):
+        for j in range(i + 1, count):
+            if find_sound_conflicts(voices[i], voices[j]):
+                adjacency[i].append(j)
+                adjacency[j].append(i)
+
+    color = [-1] * count
+    parent = [-1] * count
+    depth = [0] * count
+    # Components in ascending root order; each lists the voice indices
+    # colored 0 and 1 from the component's smallest-index root.
+    components: list[tuple[list[int], list[int], Fraction, Fraction]] = []
+    for root in range(count):
+        if color[root] != -1:
+            continue
+        color[root] = 0
+        queue = deque([root])
+        group0: list[int] = []
+        group1: list[int] = []
+        while queue:
+            node = queue.popleft()
+            (group0 if color[node] == 0 else group1).append(node)
+            for neighbor in adjacency[node]:
+                if color[neighbor] == -1:
+                    color[neighbor] = color[node] ^ 1
+                    parent[neighbor] = node
+                    depth[neighbor] = depth[node] + 1
+                    queue.append(neighbor)
+                elif color[neighbor] == color[node]:
+                    cycle_indices = _find_odd_cycle(
+                        adjacency, color, parent, depth, node, neighbor
+                    )
+                    raise PracticeTracksConflict(
+                        [voices[index]["name"] for index in cycle_indices]
+                    )
+        components.append(
+            (
+                group0,
+                group1,
+                sum((weights[i] for i in group0), Fraction(0)),
+                sum((weights[i] for i in group1), Fraction(0)),
+            )
+        )
+
+    best_difference: Fraction | None = None
+    best_labels: tuple[int, ...] | None = None
+
+    # Enumerate one orientation bit per component: 0 puts color 0 on A,
+    # 1 swaps the component. Components are independent, so the product
+    # covers every feasible assignment exactly once.
+    total = 1 << len(components)
+    for mask in range(total):
+        load_a = Fraction(0)
+        load_b = Fraction(0)
+        labels = [0] * count
+        for position, (group0, group1, weight0, weight1) in enumerate(
+            components
+        ):
+            if (mask >> position) & 1:
+                load_a += weight1
+                load_b += weight0
+                for index in group1:
+                    labels[index] = 0
+                for index in group0:
+                    labels[index] = 1
+            else:
+                load_a += weight0
+                load_b += weight1
+                for index in group0:
+                    labels[index] = 0
+                for index in group1:
+                    labels[index] = 1
+        difference = abs(load_a - load_b)
+        label_tuple = tuple(labels)
+        if (
+            best_difference is None
+            or difference < best_difference
+            or (difference == best_difference and label_tuple < best_labels)
+        ):
+            best_difference = difference
+            best_labels = label_tuple
+            best_loads = (load_a, load_b)
+
+    assert best_difference is not None and best_labels is not None
+    load_a, load_b = best_loads
+    track_a = [
+        {"name": voices[i]["name"], "weight": weights[i]}
+        for i, label in enumerate(best_labels)
+        if label == 0
+    ]
+    track_b = [
+        {"name": voices[i]["name"], "weight": weights[i]}
+        for i, label in enumerate(best_labels)
+        if label == 1
+    ]
+    return {
+        "track_a": track_a,
+        "track_b": track_b,
+        "load_a": load_a,
+        "load_b": load_b,
+        "load_difference": best_difference,
     }
 
 
